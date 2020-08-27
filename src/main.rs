@@ -7,7 +7,7 @@ use core::{
 };
 use std::{
     collections::{btree_map, BTreeMap},
-    fs,
+    env, fs,
     io::{self, Write as _},
     path::PathBuf,
     process,
@@ -17,6 +17,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context};
 use arrayref::array_ref;
+use colored::Colorize;
 use gimli::{
     read::{CfaRule, DebugFrame, UnwindSection},
     BaseAddresses, EndianSlice, LittleEndian, RegisterRule, UninitializedUnwindContext,
@@ -68,7 +69,7 @@ fn notmain() -> Result<i32, anyhow::Error> {
     let elf = ElfFile::new(&bytes).map_err(|s| anyhow!("{}", s))?;
 
     #[cfg(feature = "defmt")]
-    let table = {
+    let (table, locs) = {
         let table = elf2table::parse(&bytes)?;
 
         if table.is_none() && opts.defmt {
@@ -77,7 +78,9 @@ fn notmain() -> Result<i32, anyhow::Error> {
             eprintln!("warning: application may be using `defmt` but `--defmt` flag was not used");
         }
 
-        table
+        let locs = elf2table::get_locations(&bytes)?;
+
+        (table, locs)
     };
 
     // sections used in cortex-m-rt
@@ -252,6 +255,11 @@ fn notmain() -> Result<i32, anyhow::Error> {
     #[cfg(feature = "defmt")]
     let mut frames = vec![];
     let mut was_halted = false;
+    #[cfg(feature = "defmt")]
+    let current_dir = env::current_dir()?;
+    #[cfg(feature = "defmt")]
+    let mut last_path = None;
+    // TODO strip prefix from crates-io paths
     while CONTINUE.load(Ordering::Relaxed) {
         if let Some(logging_channel) = &mut logging_channel {
             let num_bytes_read = logging_channel.read(&mut read_buf)?;
@@ -266,7 +274,38 @@ fn notmain() -> Result<i32, anyhow::Error> {
                             while let Ok((frame, consumed)) =
                                 decoder::decode(&frames, table.as_ref().unwrap())
                             {
-                                writeln!(stdout, "{}", frame.display(true))?;
+                                let loc = locs.get(&frame.index()).ok_or_else(|| {
+                                    anyhow!(
+                                        "no location information from log frame #{}",
+                                        frame.index()
+                                    )
+                                })?;
+
+                                let relpath =
+                                    if let Ok(relpath) = loc.file.strip_prefix(&current_dir) {
+                                        relpath
+                                    } else {
+                                        // not relative; use full path
+                                        &loc.file
+                                    };
+
+                                if last_path != Some(relpath) {
+                                    writeln!(
+                                        stdout,
+                                        "{}{}",
+                                        if last_path.is_some() { "\n" } else { "" },
+                                        relpath.display().to_string().magenta()
+                                    )?;
+                                    last_path = Some(relpath);
+                                }
+
+                                writeln!(
+                                    stdout,
+                                    "{}: {}",
+                                    loc.line.to_string().green(),
+                                    frame.display(true)
+                                )?;
+
                                 let num_frames = frames.len();
                                 frames.rotate_left(consumed);
                                 frames.truncate(num_frames - consumed);
